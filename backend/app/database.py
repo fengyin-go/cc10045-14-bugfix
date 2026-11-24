@@ -240,6 +240,7 @@ DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_name TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
         metric_ids TEXT NOT NULL DEFAULT '[]',
         report_period TEXT NOT NULL,
         output_format TEXT NOT NULL DEFAULT 'json',
@@ -292,13 +293,60 @@ DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS subscriptions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sub_name TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
         metric_id INTEGER,
+        related_metric TEXT NOT NULL DEFAULT '',
         push_condition TEXT NOT NULL DEFAULT '{}',
         push_channel TEXT DEFAULT '',
         status TEXT NOT NULL DEFAULT '待生效',
         last_pushed_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
+
+    # 口径回算：上一期原始数据按新口径重算的可复核记录，
+    # 订阅比较在口径过渡期间以此作为能对上的基准。
+    """CREATE TABLE IF NOT EXISTS metric_recalibrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric_id INTEGER NOT NULL,
+        from_calibration INTEGER NOT NULL,
+        to_calibration INTEGER NOT NULL,
+        period_time TEXT NOT NULL,
+        original_value REAL NOT NULL,
+        recalculated_value REAL NOT NULL,
+        review_status TEXT NOT NULL DEFAULT '待复核',
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(metric_id, from_calibration, to_calibration, period_time),
+        FOREIGN KEY (metric_id) REFERENCES metrics(id)
+    )""",
+
+    # 订阅比较事实：每次判断的本次值、基准、口径、变化比例与推送状态。
+    # 订阅轮询与值班日报共用同一份事实；pair_key 去重保证同一对
+    # 已确认采样只推送一次。
+    """CREATE TABLE IF NOT EXISTS subscription_checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subscription_id INTEGER NOT NULL,
+        metric_id INTEGER,
+        pair_key TEXT NOT NULL UNIQUE,
+        current_value_id INTEGER,
+        current_value REAL,
+        current_calibration INTEGER,
+        baseline_value_id INTEGER,
+        baseline_value REAL,
+        baseline_calibration INTEGER,
+        baseline_source TEXT NOT NULL DEFAULT 'none',
+        recalibration_id INTEGER,
+        change_pct REAL,
+        threshold_pct REAL,
+        comparable INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        triggered INTEGER NOT NULL DEFAULT 0,
+        pushed INTEGER NOT NULL DEFAULT 0,
+        pushed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sub_checks_sub ON subscription_checks(subscription_id, id)",
 
     """CREATE TABLE IF NOT EXISTS exports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,8 +421,26 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        self._migrate(conn)
         conn.commit()
         conn.close()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """轻量迁移：为既有库补充后加的列（CREATE IF NOT EXISTS 覆盖不到）。"""
+        sub_cols = {row[1] for row in conn.execute("PRAGMA table_info(subscriptions)")}
+        if "related_metric" not in sub_cols:
+            conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN related_metric TEXT NOT NULL DEFAULT ''"
+            )
+        if "name" not in sub_cols:
+            conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN name TEXT NOT NULL DEFAULT ''"
+            )
+        report_cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)")}
+        if "name" not in report_cols:
+            conn.execute(
+                "ALTER TABLE reports ADD COLUMN name TEXT NOT NULL DEFAULT ''"
+            )
 
     @classmethod
     def get(cls) -> AnalyticsDB:

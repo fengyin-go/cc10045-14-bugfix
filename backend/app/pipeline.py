@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.database import db
+from app.subscription_compare import evaluate_active_subscriptions, public_fact
 
 
 # ============================================================================
@@ -903,14 +904,25 @@ def generate_report(report: dict[str, Any]) -> dict[str, Any]:
                 "status": latest["comparison_status"] if latest else "已保存",
             })
 
+    # 值班日报的订阅触发核对：与订阅轮询共用同一份比较事实，
+    # 基准数据、采用口径、变化比例或不可比原因随报告内容一并持久化，
+    # 之后重新打开日报时判断依据不会被更新的采样覆盖。
+    subscription_facts = [
+        public_fact(f) for f in evaluate_active_subscriptions(persist=True)
+    ]
+
     report_content = {
         "report_name": report.get("报告名称", report.get("report_name", "")),
         "generated_at": db.now(),
         "sections": sections,
+        "subscription_comparisons": subscription_facts,
         "summary": {
             "total_metrics": len(sections),
             "abnormal_count": sum(1 for s in sections if s.get("status") == "有异常"),
             "normal_count": sum(1 for s in sections if s.get("status") == "已保存"),
+            "subscription_checked": len(subscription_facts),
+            "subscription_triggered": sum(1 for f in subscription_facts if f["triggered"]),
+            "subscription_pending": sum(1 for f in subscription_facts if not f["comparable"]),
         },
     }
 

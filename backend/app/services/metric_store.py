@@ -120,6 +120,59 @@ class MetricStoreService(BaseModuleService):
             "significant": abs(diff_pct) > 5,
         }
 
+    def register_recalibration(self, metric_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """登记一条口径回算：把上一期原始数据按新口径重算。
+
+        只有「已复核」的回算才会被订阅比较采用为能对上的基准；
+        同一期间同一口径转换重复登记时更新原记录。
+        """
+        metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+        if metric is None:
+            return {"ok": False, "message": f"指标 {metric_id} 不存在"}
+
+        try:
+            from_cal = int(payload.get("from_calibration"))
+            to_cal = int(payload.get("to_calibration"))
+            original = float(payload.get("original_value"))
+            recalculated = float(payload.get("recalculated_value"))
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "回算参数缺失或格式错误"}
+
+        period_time = str(payload.get("period_time") or "").strip()
+        if not period_time:
+            return {"ok": False, "message": "缺少回算期间 period_time"}
+        if from_cal == to_cal:
+            return {"ok": False, "message": "回算前后口径不能相同"}
+
+        review_status = str(payload.get("review_status") or "待复核").strip() or "待复核"
+        note = str(payload.get("note") or "")
+
+        db.execute(
+            "INSERT INTO metric_recalibrations(metric_id,from_calibration,to_calibration,"
+            "period_time,original_value,recalculated_value,review_status,note) "
+            "VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(metric_id,from_calibration,to_calibration,period_time) DO UPDATE SET "
+            "original_value=excluded.original_value, "
+            "recalculated_value=excluded.recalculated_value, "
+            "review_status=excluded.review_status, note=excluded.note",
+            [metric_id, from_cal, to_cal, period_time,
+             original, recalculated, review_status, note],
+        )
+        row = db.fetchone(
+            "SELECT * FROM metric_recalibrations WHERE metric_id=? AND from_calibration=? "
+            "AND to_calibration=? AND period_time=?",
+            [metric_id, from_cal, to_cal, period_time],
+        )
+        return {"ok": True, "message": "回算已登记", "recalibration": row}
+
+    def list_recalibrations(self, metric_id: int) -> list[dict[str, Any]]:
+        """列出指标的口径回算记录。"""
+        return db.fetchall(
+            "SELECT * FROM metric_recalibrations WHERE metric_id=? "
+            "ORDER BY period_time DESC, id DESC",
+            [metric_id],
+        )
+
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
         snapshot["total_metrics"] = db.count("metrics")

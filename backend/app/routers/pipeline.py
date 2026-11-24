@@ -1,7 +1,7 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 
 from app.database import db
 from app.pipeline import (
@@ -106,6 +106,41 @@ def api_generate_report(report_id: int) -> dict:
     """对指定报告模板执行生成。"""
     svc = service_for("data_report")
     return svc.generate(report_id)
+
+
+@router.get("/report/{report_id}/outputs")
+def api_report_outputs(report_id: int, limit: int = 10) -> dict:
+    """值班日报详情：历史生成内容（含订阅触发核对明细），原判断依据不被覆盖。"""
+    svc = service_for("data_report")
+    return {"items": svc.recent_outputs(report_id, limit)}
+
+
+@router.post("/subscriptions/check")
+def api_check_subscriptions() -> dict:
+    """轮询所有已生效订阅：满足条件且该对已确认采样未推送过时记录一次推送。"""
+    svc = service_for("data_subscription")
+    return svc.check_subscriptions()
+
+
+@router.get("/subscriptions/checks")
+def api_subscription_checks(subscription_id: int | None = None) -> dict:
+    """订阅比较事实列表：轮询与值班日报共用的判断依据。"""
+    svc = service_for("data_subscription")
+    return {"items": svc.list_checks(subscription_id)}
+
+
+@router.post("/metrics/{metric_id}/recalibrations")
+def api_register_recalibration(metric_id: int, payload: dict = Body(default_factory=dict)) -> dict:
+    """登记口径回算：把上一期原始数据按新口径重算，供订阅比较采用。"""
+    svc = service_for("metric_store")
+    return svc.register_recalibration(metric_id, payload)
+
+
+@router.get("/metrics/{metric_id}/recalibrations")
+def api_list_recalibrations(metric_id: int) -> dict:
+    """列出指标的口径回算记录。"""
+    svc = service_for("metric_store")
+    return {"items": svc.list_recalibrations(metric_id)}
 
 
 @router.post("/alerts/check-all")

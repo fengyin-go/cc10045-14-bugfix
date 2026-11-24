@@ -1,15 +1,21 @@
 """数据订阅领域服务：订阅指标变化并在满足条件时触发推送。
 
 真实数据流：定义订阅任务（关联指标/推送条件/推送渠道）
-→ 定时检查 metric_values 最新值 → 匹配推送条件 → 更新 subscriptions 推送时间。
+→ 轮询时由 app.subscription_compare 构建比较事实（本次值 + 能对上的
+基准 + 口径核对）→ 满足推送条件且该对已确认采样尚未推送过才记录推送。
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.database import db
 from app.services.base import BaseModuleService
+from app.subscription_compare import (
+    evaluate_active_subscriptions,
+    list_stored_facts,
+    mark_fact_pushed,
+    public_fact,
+)
 
 
 class DataSubscriptionService(BaseModuleService):
@@ -23,65 +29,43 @@ class DataSubscriptionService(BaseModuleService):
     NEGATIVE_ACTIONS = ["暂停订阅"]
 
     def check_subscriptions(self) -> dict[str, Any]:
-        """检查所有已生效订阅，满足条件的记录推送。"""
-        subs = db.fetchall("SELECT * FROM subscriptions WHERE status='已生效'")
-        results = []
+        """轮询所有已生效订阅：同一对已确认采样只推送一次。
 
-        for sub in subs:
-            metric_name = sub.get("关联指标", sub.get("metric_id", ""))
-            push_condition_raw = sub.get("推送条件", sub.get("push_condition", "{}"))
+        比较事实由共享构建器产出并持久化；只有「已触发且该事实未推送过」
+        的订阅才在本次轮询记录一次推送。
+        """
+        facts = evaluate_active_subscriptions(persist=True)
+        results: list[dict[str, Any]] = []
+        pushed_count = 0
 
-            try:
-                condition = json.loads(push_condition_raw) if isinstance(push_condition_raw, str) else push_condition_raw
-            except (json.JSONDecodeError, TypeError):
-                condition = {}
+        for fact in facts:
+            pushed_now = False
+            if fact["triggered"] and not fact["pushed"]:
+                mark_fact_pushed(fact["check_id"])
+                db.update("subscriptions", {"last_pushed_at": db.now()},
+                          "id=?", [fact["subscription_id"]])
+                fact["pushed"] = True
+                pushed_now = True
+                pushed_count += 1
+            item = public_fact(fact)
+            item["pushed_now"] = pushed_now
+            results.append(item)
 
-            metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{metric_name}%"])
-            if not metric:
-                results.append({"sub_name": sub["sub_name"], "triggered": False, "reason": "指标未找到"})
-                continue
+        return {
+            "checked": len(facts),
+            "triggered": sum(1 for f in facts if f["triggered"]),
+            "pushed": pushed_count,
+            "details": results,
+        }
 
-            latest = db.fetchone(
-                "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-                [metric["id"]],
-            )
-            if not latest:
-                results.append({"sub_name": sub["sub_name"], "triggered": False, "reason": "无指标值"})
-                continue
-
-            triggered = _evaluate_push_condition(latest["snapshot_value"], condition)
-            if triggered:
-                db.update("subscriptions", {"last_pushed_at": db.now()}, "id=?", [sub["id"]])
-                results.append({
-                    "sub_name": sub["sub_name"],
-                    "triggered": True,
-                    "value": latest["snapshot_value"],
-                    "channel": sub.get("推送渠道", sub.get("push_channel", "")),
-                })
-            else:
-                results.append({"sub_name": sub["sub_name"], "triggered": False, "value": latest["snapshot_value"]})
-
-        triggered_count = sum(1 for r in results if r.get("triggered"))
-        return {"checked": len(subs), "triggered": triggered_count, "details": results}
+    def list_checks(self, subscription_id: int | None = None,
+                    limit: int = 50) -> list[dict[str, Any]]:
+        """已持久化的比较事实：值班日报与订阅排查共用的判断依据。"""
+        return list_stored_facts(subscription_id, limit)
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
         snapshot["total_subscriptions"] = db.count("subscriptions")
         snapshot["active"] = db.count("subscriptions", "status='已生效'")
+        snapshot["today_pushed"] = db.count("subscription_checks", "pushed=1")
         return snapshot
-
-
-def _evaluate_push_condition(value: float, condition: dict[str, Any]) -> bool:
-    op = condition.get("op", "gt")
-    threshold = float(condition.get("value", 0))
-    if op == "gt":
-        return value > threshold
-    elif op == "lt":
-        return value < threshold
-    elif op == "gte":
-        return value >= threshold
-    elif op == "lte":
-        return value <= threshold
-    elif op == "change_pct":
-        return abs(value) > threshold
-    return False
